@@ -23,6 +23,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
@@ -92,7 +93,11 @@ def build_preprocessor(
     Returns:
         ColumnTransformer configurado (sin ajustar).
     """
-    numeric_transformer = StandardScaler()
+    # Imputer antes del scaler para manejar NaN (ej: aircraft_age no disponible)
+    numeric_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
 
     categorical_transformer = OneHotEncoder(
         handle_unknown="ignore",  # Categorias no vistas en test -> vector de ceros

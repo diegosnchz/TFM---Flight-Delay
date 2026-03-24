@@ -1,0 +1,5 @@
+model,auc_roc,auc_pr,f1,precision,recall,log_loss,threshold
+random_forest,0.6611,0.0268,0.045,0.0236,0.5066,0.4471,0.5
+xgboost,0.6561,0.0246,0.0414,0.0214,0.5908,0.5352,0.5
+logistic_regression,0.6924,0.0241,0.0481,0.0252,0.5262,0.6018,0.5
+lightgbm,0.635,0.0227,0.0439,0.023,0.4687,0.4553,0.5

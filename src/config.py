@@ -54,12 +54,17 @@ OPENFLIGHTS_URL = (
 # Aerolíneas low-cost analizadas
 # ---------------------------------------------------------------------------
 
-# Codigos IATA de las 4 aerolineas objetivo del estudio
+# NOTA: Se usa el dataset de vuelos domesticos de EE.UU. (Bureau of
+# Transportation Statistics, via Kaggle) como proxy metodologico.
+# Las LCC estadounidenses son analogas operativamente a las europeas:
+#   WN (Southwest) ~ Ryanair  |  NK (Spirit) ~ Wizz Air
+#   F9 (Frontier)  ~ easyJet  |  G4 (Allegiant) ~ Vueling
+# La logica EU261 se aplica identicamente sobre los datos de retraso.
 LOW_COST_AIRLINES = {
-    "FR": "Ryanair",
-    "U2": "easyJet",
-    "W6": "Wizz Air",
-    "VY": "Vueling",
+    "WN": "Southwest Airlines",
+    "NK": "Spirit Airlines",
+    "F9": "Frontier Airlines",
+    "G4": "Allegiant Air",
 }
 
 LOW_COST_IATA_CODES = list(LOW_COST_AIRLINES.keys())
@@ -126,10 +131,10 @@ FIGURE_SIZE_DEFAULT = (12, 8)
 PALETTE_MUTED = "muted"
 
 AIRLINE_COLORS = {
-    "FR": "#073580",  # Azul Ryanair
-    "U2": "#FF6600",  # Naranja easyJet
-    "W6": "#C8102E",  # Rojo Wizz Air
-    "VY": "#00843D",  # Verde Vueling
+    "WN": "#FFBF00",  # Amarillo Southwest
+    "NK": "#FFA500",  # Naranja Spirit
+    "F9": "#006747",  # Verde Frontier
+    "G4": "#003DA5",  # Azul Allegiant
 }
 
 # Colores para clases (retraso / sin retraso)

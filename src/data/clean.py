@@ -66,65 +66,56 @@ HOLIDAY_PERIODS = [
 
 def parse_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convierte las columnas de fecha/hora a tipo datetime de pandas.
+    Convierte flight_date a datetime y construye la hora de salida como
+    feature temporal a partir de sched_dep_hhmm (entero HHMM, ej: 1430).
 
-    Intenta multiples formatos para maxima compatibilidad con distintas
-    fuentes de datos.
+    En el dataset BTS, el retraso ya viene calculado en 'delay_minutes'
+    (columna ARR_DELAY), por lo que NO se necesita calcular la diferencia
+    entre llegada real y programada.
 
     Args:
-        df: DataFrame con columnas sched_arr, actual_arr, sched_dep,
-            actual_dep (y opcionalmente flight_date).
+        df: DataFrame con columna flight_date (str) y sched_dep_hhmm (int).
 
     Returns:
-        DataFrame con columnas datetime correctamente tipadas.
+        DataFrame con flight_date como datetime y columna 'hour' extraida.
     """
-    datetime_cols = ["sched_arr", "actual_arr", "sched_dep", "actual_dep"]
+    df = df.copy()
 
-    for col in datetime_cols:
-        if col in df.columns:
-            if not pd.api.types.is_datetime64_any_dtype(df[col]):
-                logger.info("Convirtiendo columna '%s' a datetime...", col)
-                df[col] = pd.to_datetime(df[col], infer_datetime_format=True, errors="coerce")
+    if "flight_date" in df.columns:
+        df["flight_date"] = pd.to_datetime(df["flight_date"], errors="coerce")
+        n_nat = df["flight_date"].isna().sum()
+        if n_nat > 0:
+            logger.warning("flight_date: %d valores no parseables.", n_nat)
 
-            n_nat = df[col].isna().sum()
-            if n_nat > 0:
-                logger.warning(
-                    "Columna '%s': %d valores no convertibles a datetime (%.1f%%).",
-                    col,
-                    n_nat,
-                    100.0 * n_nat / len(df),
-                )
+    # Extraer hora de salida del entero HHMM (ej: 1430 -> hora 14)
+    if "sched_dep_hhmm" in df.columns:
+        dep_hhmm = pd.to_numeric(df["sched_dep_hhmm"], errors="coerce")
+        df["hour"] = (dep_hhmm // 100).astype("Int64")
+        logger.info("Columna 'hour' extraida de sched_dep_hhmm.")
 
     return df
 
 
 def calculate_delay(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcula el retraso en minutos como diferencia entre llegada real y
-    llegada programada.
-
-    Logica:
-        delay_minutes = actual_arr - sched_arr (en minutos)
-
-    Valores negativos indican que el vuelo llego antes de lo programado.
+    En el dataset BTS, el retraso ya viene en la columna 'delay_minutes'
+    (ARR_DELAY del BTS). Solo se valida y se registran estadisticas.
 
     Args:
-        df: DataFrame con columnas sched_arr y actual_arr (datetime).
+        df: DataFrame con columna 'delay_minutes' ya presente.
 
     Returns:
-        DataFrame con columna 'delay_minutes' anadida.
+        DataFrame con 'delay_minutes' validado (sin cambios).
     """
     df = df.copy()
 
-    if "actual_arr" not in df.columns or "sched_arr" not in df.columns:
+    if "delay_minutes" not in df.columns:
         raise ValueError(
-            "Se necesitan las columnas 'actual_arr' y 'sched_arr' "
-            "para calcular el retraso. Revisa el mapeo de columnas en ingest.py."
+            "Columna 'delay_minutes' no encontrada. "
+            "Verifica que ingest.py mapeo correctamente ARR_DELAY."
         )
 
-    df["delay_minutes"] = (
-        (df["actual_arr"] - df["sched_arr"]).dt.total_seconds() / 60.0
-    )
+    df["delay_minutes"] = pd.to_numeric(df["delay_minutes"], errors="coerce")
 
     logger.info(
         "Estadisticas de retraso (minutos): "
@@ -174,9 +165,8 @@ def remove_cancelled_flights(df: pd.DataFrame) -> pd.DataFrame:
     """
     Elimina vuelos cancelados del dataset.
 
-    Los vuelos cancelados son aquellos sin hora de llegada real (actual_arr
-    es NaT). Estos tienen un tratamiento diferente en el EU261 (no se
-    analizan en este TFM).
+    En el dataset BTS, los vuelos cancelados tienen cancelled=1 y
+    delay_minutes=NaN. Se eliminan por ambas condiciones.
 
     Args:
         df: DataFrame de vuelos.
@@ -185,11 +175,19 @@ def remove_cancelled_flights(df: pd.DataFrame) -> pd.DataFrame:
         DataFrame sin vuelos cancelados.
     """
     n_before = len(df)
-    df_clean = df[df["actual_arr"].notna()].copy()
+
+    mask_cancelled = pd.Series(False, index=df.index)
+    if "cancelled" in df.columns:
+        mask_cancelled = pd.to_numeric(df["cancelled"], errors="coerce").fillna(0) == 1
+
+    # Adicionalmente, vuelos sin delay_minutes no son utilizables
+    mask_no_delay = df["delay_minutes"].isna()
+
+    df_clean = df[~mask_cancelled & ~mask_no_delay].copy()
     n_removed = n_before - len(df_clean)
 
     logger.info(
-        "Vuelos cancelados eliminados: %d (%.1f%%)",
+        "Vuelos eliminados (cancelados o sin retraso registrado): %d (%.1f%%)",
         n_removed,
         100.0 * n_removed / n_before if n_before > 0 else 0,
     )
@@ -244,7 +242,8 @@ def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame sin duplicados.
     """
-    key_cols = [c for c in ["origin", "destination", "airline_code", "sched_dep"]
+    key_cols = [c for c in ["origin", "destination", "airline_code",
+                             "flight_date", "sched_dep_hhmm", "flight_number"]
                 if c in df.columns]
 
     if not key_cols:
@@ -320,7 +319,10 @@ def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
 
 def create_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Crea features temporales a partir de la fecha/hora del vuelo.
+    Crea features temporales a partir de flight_date y sched_dep_hhmm.
+
+    En el dataset BTS, flight_date es la fecha del vuelo y 'hour' ya fue
+    extraida en parse_datetime_columns desde sched_dep_hhmm.
 
     Features creadas:
       - hour: hora de salida programada (0-23)
@@ -330,94 +332,107 @@ def create_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
       - day_of_year: dia del ano (1-365)
       - is_weekend: 1 si sabado o domingo
       - is_summer: 1 si junio, julio, agosto o septiembre
-      - is_holiday_period: 1 si cae en periodo vacacional europeo tipico
+      - is_holiday_period: 1 si cae en periodo vacacional
       - departure_hour_bin: categoria por bloques horarios
 
     Args:
-        df: DataFrame con columna 'sched_dep' (datetime).
+        df: DataFrame con columnas 'flight_date' (datetime) y 'hour' (int).
 
     Returns:
         DataFrame con features temporales anadidas.
     """
     df = df.copy()
 
-    # Usar sched_dep si disponible, si no usar sched_arr
-    time_col = None
-    for col in ["sched_dep", "sched_arr"]:
-        if col in df.columns and pd.api.types.is_datetime64_any_dtype(df[col]):
-            time_col = col
-            break
-
-    if time_col is None:
-        logger.warning(
-            "No hay columna de fecha/hora valida para crear features temporales."
-        )
+    if "flight_date" not in df.columns or not pd.api.types.is_datetime64_any_dtype(df["flight_date"]):
+        logger.warning("Columna 'flight_date' no disponible o no es datetime.")
         return df
 
-    logger.info("Creando features temporales desde columna '%s'...", time_col)
+    logger.info("Creando features temporales desde 'flight_date'...")
 
-    df["hour"] = df[time_col].dt.hour
-    df["day_of_week"] = df[time_col].dt.dayofweek  # 0=lunes
-    df["month"] = df[time_col].dt.month
-    df["year"] = df[time_col].dt.year
-    df["day_of_year"] = df[time_col].dt.dayofyear
+    # Si hour no fue extraida previamente, crearla como NaN
+    if "hour" not in df.columns:
+        df["hour"] = np.nan
+
+    df["day_of_week"] = df["flight_date"].dt.dayofweek
+    df["month"] = df["flight_date"].dt.month
+    df["year"] = df["flight_date"].dt.year
+    df["day_of_year"] = df["flight_date"].dt.dayofyear
 
     df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
-
-    # Verano: junio, julio, agosto, septiembre (peak season aerolineas low-cost)
     df["is_summer"] = df["month"].isin([6, 7, 8, 9]).astype(int)
 
-    # Periodos vacacionales europeos
+    # Periodos de alta demanda (vacaciones en EE.UU. y equivalentes globales)
     df["is_holiday_period"] = 0
     for month, day_start, day_end in HOLIDAY_PERIODS:
         mask = (
             (df["month"] == month)
-            & (df[time_col].dt.day >= day_start)
-            & (df[time_col].dt.day <= day_end)
+            & (df["flight_date"].dt.day >= day_start)
+            & (df["flight_date"].dt.day <= day_end)
         )
         df.loc[mask, "is_holiday_period"] = 1
 
-    # Bloques horarios
-    df["departure_hour_bin"] = pd.cut(
-        df["hour"],
-        bins=HOUR_BINS,
-        labels=HOUR_LABELS,
-        right=False,
-    )
+    # Bloques horarios (solo si hour esta disponible y no es todo NaN)
+    hour_col = pd.to_numeric(df["hour"], errors="coerce")
+    if hour_col.notna().sum() > 0:
+        df["departure_hour_bin"] = pd.cut(
+            hour_col,
+            bins=HOUR_BINS,
+            labels=HOUR_LABELS,
+            right=False,
+        )
+    else:
+        df["departure_hour_bin"] = "desconocido"
 
     logger.info(
-        "Features temporales creadas: hour, day_of_week, month, year, "
-        "day_of_year, is_weekend, is_summer, is_holiday_period, "
-        "departure_hour_bin"
+        "Features temporales creadas: day_of_week, month, year, "
+        "day_of_year, is_weekend, is_summer, is_holiday_period, departure_hour_bin"
     )
 
     return df
 
 
+MILES_TO_KM = 1.60934
+
+
 def add_distance_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Anade la distancia de la ruta y la banda de compensacion EU261.
+    Anade la distancia en km y la banda de compensacion EU261.
 
-    Requiere que existan las columnas 'origin' y 'destination' con codigos
-    IATA de los aeropuertos. Descarga o carga las coordenadas de OpenFlights.
+    En el dataset BTS, la distancia ya viene en millas (columna DISTANCE,
+    renombrada a distance_miles). Se convierte a kilometros y se asigna
+    la banda EU261 correspondiente.
+
+    Si distance_miles no esta disponible, se calcula via Haversine
+    desde las coordenadas de OpenFlights.
 
     Features creadas:
-      - distance_km: distancia ortodromica entre origen y destino
+      - distance_km: distancia en km
       - eu261_compensation: 250, 400 o 600 EUR segun la distancia
 
     Args:
-        df: DataFrame con columnas 'origin' y 'destination'.
+        df: DataFrame con 'distance_miles' o columnas 'origin'/'destination'.
 
     Returns:
         DataFrame con features de distancia anadidas.
     """
     df = df.copy()
 
-    logger.info("Calculando distancias de rutas (Haversine)...")
-    airports_df = load_airports()
-    df["distance_km"] = calculate_route_distances(
-        df, origin_col="origin", dest_col="destination", airports_df=airports_df
-    )
+    if "distance_miles" in df.columns:
+        df["distance_km"] = pd.to_numeric(df["distance_miles"], errors="coerce") * MILES_TO_KM
+        logger.info(
+            "Distancia convertida de millas a km. "
+            "Rango: %.0f - %.0f km",
+            df["distance_km"].min(), df["distance_km"].max(),
+        )
+    elif "origin" in df.columns and "destination" in df.columns:
+        logger.info("Calculando distancias via Haversine desde coordenadas...")
+        airports_df = load_airports()
+        df["distance_km"] = calculate_route_distances(
+            df, origin_col="origin", dest_col="destination", airports_df=airports_df
+        )
+    else:
+        logger.warning("Sin columna de distancia. Se asignara 1000 km por defecto.")
+        df["distance_km"] = 1000.0
 
     # Banda de compensacion EU261 segun distancia
     df["eu261_compensation"] = df["distance_km"].apply(
@@ -426,10 +441,8 @@ def add_distance_features(df: pd.DataFrame) -> pd.DataFrame:
 
     n_with_dist = df["distance_km"].notna().sum()
     logger.info(
-        "Distancias calculadas: %d de %d vuelos (%.1f%%)",
-        n_with_dist,
-        len(df),
-        100.0 * n_with_dist / len(df),
+        "Distancias validas: %d de %d vuelos (%.1f%%)",
+        n_with_dist, len(df), 100.0 * n_with_dist / len(df),
     )
 
     return df

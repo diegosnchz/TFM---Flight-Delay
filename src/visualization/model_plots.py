@@ -204,12 +204,15 @@ def fig_14_shap_summary(
         idx = np.random.choice(X_processed.shape[0], sample_size, replace=False)
         X_sample = X_processed[idx]
 
-        if hasattr(classifier, "get_booster"):  # XGBoost
+        # Usar TreeExplainer para modelos basados en arboles (RF, XGBoost, LightGBM)
+        # y LinearExplainer para modelos lineales
+        if hasattr(classifier, "get_booster") or hasattr(classifier, "booster_") \
+                or hasattr(classifier, "estimators_"):
             explainer = shap.TreeExplainer(classifier)
-        elif hasattr(classifier, "booster_"):  # LightGBM
-            explainer = shap.TreeExplainer(classifier)
-        else:
+        elif hasattr(classifier, "coef_"):
             explainer = shap.LinearExplainer(classifier, X_sample)
+        else:
+            explainer = shap.Explainer(classifier, X_sample)
 
         shap_values = explainer.shap_values(X_sample)
 

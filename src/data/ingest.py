@@ -1,23 +1,23 @@
 """
-ingest.py - Carga y validacion de datos crudos de vuelos (ADRR/Kaggle).
+ingest.py - Carga y validacion de datos crudos de vuelos.
 
-Este modulo es el punto de entrada del pipeline de datos. Se encarga de:
-1. Detectar y cargar el archivo de datos crudo desde data/raw/
-2. Validar el schema (columnas, tipos de datos basicos)
-3. Filtrar solo las 4 aerolineas low-cost objetivo
+Dataset utilizado: "Flight Delay and Cancellation Dataset (2019-2023)"
+(robikscube / Bureau of Transportation Statistics, via Kaggle).
+3 millones de vuelos domesticos de EE.UU. con retraso en minutos incluido.
+
+Flujo:
+1. Detectar y cargar el archivo CSV desde data/raw/
+2. Renombrar columnas al schema interno del proyecto
+3. Filtrar solo las 4 LCCs objetivo (WN, NK, F9, G4)
 4. Registrar estadisticas de filtrado
-5. Guardar el resultado en data/processed/flights_raw_filtered.parquet
+5. Guardar en data/processed/flights_raw_filtered.parquet
 
-IMPORTANTE: Antes de ejecutar este modulo, coloca los datos en data/raw/.
 Ejecutar con: python -m src.data.ingest
 """
 
 from __future__ import annotations
 
-import logging
 import sys
-from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -32,295 +32,128 @@ from src.config import (
 logger = setup_logging(__name__)
 
 # ---------------------------------------------------------------------------
-# Schema esperado del ADRR de Eurocontrol
+# Mapeo de columnas: nombre original del CSV -> nombre interno del proyecto
 # ---------------------------------------------------------------------------
-# ATENCION: Estos nombres de columna son los esperados del dataset ADRR.
-# Si usas el dataset de Kaggle u otra fuente, el mapeo puede diferir.
-# Ajustar COLUMN_MAP segun el formato real de tus datos.
-
-# Columnas MINIMAS requeridas y sus tipos esperados
-# Clave: nombre en el archivo fuente | Valor: nombre interno del proyecto
-ADRR_COLUMN_MAP = {
-    # Ajusta estos nombres segun las columnas reales de tu archivo
-    # Formato tipico ADRR:
-    "ADEP": "origin",                      # Aeropuerto de salida (ICAO o IATA)
-    "ADES": "destination",                  # Aeropuerto de llegada
-    "AC_Operator": "airline_code",          # Codigo IATA de la aerolinea
-    "AC_Type": "aircraft_type",             # Tipo de aeronave
-    "FILED_OFF_BLOCK_TIME": "sched_dep",    # Hora de salida programada
-    "ACTUAL_OFF_BLOCK_TIME": "actual_dep",  # Hora de salida real
-    "FILED_ARRIVAL_TIME": "sched_arr",      # Hora de llegada programada
-    "ACTUAL_ARRIVAL_TIME": "actual_arr",    # Hora de llegada real
-    "FLIGHT_DATE": "flight_date",           # Fecha del vuelo
+BTS_COLUMN_MAP = {
+    "FL_DATE":               "flight_date",      # Fecha del vuelo (YYYY-MM-DD)
+    "AIRLINE_CODE":          "airline_code",      # Codigo IATA de la aerolinea
+    "AIRLINE":               "airline_name",      # Nombre completo de la aerolinea
+    "FL_NUMBER":             "flight_number",     # Numero de vuelo
+    "ORIGIN":                "origin",            # IATA aeropuerto origen
+    "DEST":                  "destination",       # IATA aeropuerto destino
+    "ORIGIN_CITY":           "origin_city",
+    "DEST_CITY":             "dest_city",
+    "CRS_DEP_TIME":          "sched_dep_hhmm",   # Hora salida programada (HHMM)
+    "DEP_TIME":              "actual_dep_hhmm",  # Hora salida real (HHMM)
+    "DEP_DELAY":             "dep_delay_minutes",
+    "CRS_ARR_TIME":          "sched_arr_hhmm",   # Hora llegada programada (HHMM)
+    "ARR_TIME":              "actual_arr_hhmm",  # Hora llegada real (HHMM)
+    "ARR_DELAY":             "delay_minutes",     # Retraso llegada en minutos (USAR ESTO)
+    "CANCELLED":             "cancelled",
+    "CANCELLATION_CODE":     "cancellation_code",
+    "DIVERTED":              "diverted",
+    "DISTANCE":              "distance_miles",   # Distancia en millas (convertir a km)
+    "DELAY_DUE_CARRIER":     "delay_carrier",
+    "DELAY_DUE_WEATHER":     "delay_weather",
+    "DELAY_DUE_NAS":         "delay_nas",
+    "DELAY_DUE_SECURITY":    "delay_security",
+    "DELAY_DUE_LATE_AIRCRAFT": "delay_late_aircraft",
 }
 
-# Si los datos tienen diferentes nombres de columna, anadir mapeados aqui
-KAGGLE_COLUMN_MAP = {
-    # Dataset de Kaggle "European Flights Dataset" (alternativa)
-    # Ajustar segun el dataset especifico que uses
-    "departure_airport": "origin",
-    "arrival_airport": "destination",
-    "airline": "airline_code",
-    "aircraft_type": "aircraft_type",
-    "scheduled_departure": "sched_dep",
-    "actual_departure": "actual_dep",
-    "scheduled_arrival": "sched_arr",
-    "actual_arrival": "actual_arr",
-    "date": "flight_date",
-}
-
-# Columnas minimas necesarias en el dataset (nombres internos)
-REQUIRED_COLUMNS = [
-    "origin",
-    "destination",
-    "airline_code",
-    "sched_arr",
-    "actual_arr",
-]
+# Columnas minimas para que el pipeline funcione
+REQUIRED_COLUMNS = ["airline_code", "origin", "destination", "delay_minutes", "distance_miles"]
 
 
-def detect_raw_file() -> Optional[Path]:
-    """
-    Detecta automaticamente el archivo de datos crudos en data/raw/.
-
-    Busca archivos en este orden de preferencia:
-      1. Archivos .parquet
-      2. Archivos .csv con mas de 1 MB
-      3. Cualquier archivo .csv
-
-    Returns:
-        Ruta al archivo encontrado, o None si no hay datos.
-    """
+def detect_raw_file():
+    """Detecta el archivo mas grande en data/raw/ (parquet > csv)."""
     if not DATA_RAW_DIR.exists():
         return None
-
-    # Buscar parquet primero (mas eficiente)
-    parquets = list(DATA_RAW_DIR.glob("*.parquet"))
-    if parquets:
-        # Si hay varios, tomar el mas grande
-        return max(parquets, key=lambda p: p.stat().st_size)
-
-    # Luego CSV
-    csvs = list(DATA_RAW_DIR.glob("*.csv"))
-    if csvs:
-        return max(csvs, key=lambda p: p.stat().st_size)
-
+    for pattern in ["*.parquet", "*.csv"]:
+        files = list(DATA_RAW_DIR.glob(pattern))
+        if files:
+            return max(files, key=lambda p: p.stat().st_size)
     return None
 
 
-def load_raw_data(filepath: Path) -> pd.DataFrame:
-    """
-    Carga el archivo de datos crudo en un DataFrame de pandas.
-
-    Soporta formatos: .parquet, .csv
-
-    Args:
-        filepath: Ruta al archivo de datos.
-
-    Returns:
-        DataFrame con los datos crudos sin procesar.
-
-    Raises:
-        ValueError: Si el formato del archivo no esta soportado.
-        FileNotFoundError: Si el archivo no existe.
-    """
-    if not filepath.exists():
-        raise FileNotFoundError(f"Archivo no encontrado: {filepath}")
-
+def load_raw_data(filepath) -> pd.DataFrame:
+    """Carga el CSV o parquet crudo."""
+    logger.info("Cargando datos desde: %s", filepath.name)
     suffix = filepath.suffix.lower()
-    logger.info("Cargando datos desde: %s (formato: %s)", filepath.name, suffix)
-
     if suffix == ".parquet":
         df = pd.read_parquet(filepath)
     elif suffix == ".csv":
-        # Intentar detectar el separador automaticamente
-        df = pd.read_csv(filepath, sep=None, engine="python", low_memory=False)
-    elif suffix in (".xlsx", ".xls"):
-        df = pd.read_excel(filepath)
+        df = pd.read_csv(filepath, low_memory=False)
     else:
-        raise ValueError(
-            f"Formato no soportado: {suffix}. Usar .parquet, .csv o .xlsx"
-        )
-
+        raise ValueError(f"Formato no soportado: {suffix}")
     logger.info("Datos cargados: %d filas, %d columnas", len(df), len(df.columns))
-    logger.info("Columnas encontradas: %s", list(df.columns))
     return df
 
 
-def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Intenta mapear las columnas del archivo crudo a los nombres internos del
-    proyecto.
-
-    Primero intenta el mapeo ADRR, luego el de Kaggle. Si ninguno funciona,
-    devuelve el DataFrame original con una advertencia para que el usuario
-    ajuste el mapeo manualmente.
-
-    Args:
-        df: DataFrame con columnas en formato original.
-
-    Returns:
-        DataFrame con columnas renombradas a nombres internos.
-    """
-    columns_upper = {c.upper(): c for c in df.columns}
-
-    # Intentar mapeo ADRR
-    adrr_matches = {
-        orig: internal
-        for orig, internal in ADRR_COLUMN_MAP.items()
-        if orig.upper() in columns_upper
-    }
-    if len(adrr_matches) >= 4:
-        logger.info("Detectado formato ADRR de Eurocontrol.")
-        rename_dict = {columns_upper[orig.upper()]: internal
-                       for orig, internal in adrr_matches.items()}
-        return df.rename(columns=rename_dict)
-
-    # Intentar mapeo Kaggle
-    kaggle_matches = {
-        orig: internal
-        for orig, internal in KAGGLE_COLUMN_MAP.items()
-        if orig.upper() in columns_upper
-    }
-    if len(kaggle_matches) >= 4:
-        logger.info("Detectado formato Kaggle.")
-        rename_dict = {columns_upper[orig.upper()]: internal
-                       for orig, internal in kaggle_matches.items()}
-        return df.rename(columns=rename_dict)
-
-    # No se pudo detectar formato
-    logger.warning(
-        "No se pudo detectar el formato automaticamente. "
-        "Columnas actuales: %s\n"
-        "Ajusta ADRR_COLUMN_MAP o KAGGLE_COLUMN_MAP en ingest.py "
-        "para que coincidan con tus columnas.",
-        list(df.columns),
-    )
-    return df
-
-
-def validate_schema(df: pd.DataFrame) -> None:
-    """
-    Valida que el DataFrame contiene las columnas minimas necesarias.
-
-    Args:
-        df: DataFrame a validar.
-
-    Raises:
-        ValueError: Si faltan columnas criticas.
-    """
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-    if missing:
+def rename_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Renombra columnas del BTS al schema interno. Columnas no mapeadas se conservan."""
+    rename = {orig: intern for orig, intern in BTS_COLUMN_MAP.items() if orig in df.columns}
+    df = df.rename(columns=rename)
+    mapped = list(rename.values())
+    logger.info("Columnas renombradas: %d / %d del mapa BTS", len(rename), len(BTS_COLUMN_MAP))
+    missing_required = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing_required:
         raise ValueError(
-            f"Faltan columnas requeridas: {missing}.\n"
-            f"Columnas disponibles: {list(df.columns)}\n"
-            f"Revisa el mapeo de columnas en ingest.py."
+            f"Faltan columnas criticas tras el renombrado: {missing_required}\n"
+            f"Columnas disponibles: {list(df.columns)}"
         )
-    logger.info("Validacion de schema: OK. Columnas requeridas presentes.")
+    return df
 
 
 def filter_low_cost_airlines(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Filtra el DataFrame para incluir solo las 4 aerolineas low-cost objetivo.
-
-    Las aerolineas objetivo son: Ryanair (FR), easyJet (U2), Wizz Air (W6),
-    Vueling (VY).
-
-    Args:
-        df: DataFrame con columna 'airline_code'.
-
-    Returns:
-        DataFrame filtrado con solo las aerolineas objetivo.
-    """
+    """Filtra para quedarse solo con las 4 LCC objetivo."""
     n_before = len(df)
-    unique_airlines = df["airline_code"].unique()
-    logger.info(
-        "Aerolineas encontradas en los datos: %d -> %s",
-        len(unique_airlines),
-        sorted(unique_airlines)[:20],
-    )
+    unique = df["airline_code"].value_counts()
+    logger.info("Aerolineas en los datos (%d unicas):\n%s", len(unique), unique.to_string())
 
     df_filtered = df[df["airline_code"].isin(LOW_COST_IATA_CODES)].copy()
     n_after = len(df_filtered)
 
     logger.info(
-        "Filtrado por aerolineas low-cost: %d filas -> %d filas (%.1f%% retenido)",
-        n_before,
-        n_after,
-        100.0 * n_after / n_before if n_before > 0 else 0,
+        "Filtrado LCC: %d -> %d filas (%.1f%% retenido)",
+        n_before, n_after, 100.0 * n_after / n_before if n_before else 0,
     )
-
-    # Log de cuantos vuelos hay por aerolinea
     for code, name in LOW_COST_AIRLINES.items():
         count = (df_filtered["airline_code"] == code).sum()
-        pct = 100.0 * count / n_after if n_after > 0 else 0
-        logger.info("  %s (%s): %d vuelos (%.1f%%)", name, code, count, pct)
+        logger.info("  %s (%s): %d vuelos (%.1f%%)", name, code, count,
+                    100.0 * count / n_after if n_after else 0)
 
     if n_after == 0:
-        logger.warning(
-            "ATENCION: El filtro de aerolineas low-cost elimino TODOS los registros. "
-            "Verifica que la columna 'airline_code' contiene los codigos IATA "
-            "esperados: %s",
-            LOW_COST_IATA_CODES,
+        logger.error(
+            "El filtro LCC elimino TODOS los registros. "
+            "Codigos buscados: %s | Codigos presentes: %s",
+            LOW_COST_IATA_CODES, sorted(df["airline_code"].unique())[:20],
         )
+        sys.exit(1)
 
     return df_filtered
 
 
 def run() -> pd.DataFrame:
-    """
-    Ejecuta el pipeline completo de ingesta de datos.
-
-    Flujo:
-        1. Detectar archivo de datos en data/raw/
-        2. Cargar datos
-        3. Normalizar nombres de columnas
-        4. Validar schema
-        5. Filtrar aerolineas low-cost
-        6. Guardar en data/processed/flights_raw_filtered.parquet
-
-    Returns:
-        DataFrame con los datos filtrados y guardados.
-
-    Raises:
-        FileNotFoundError: Si no hay datos en data/raw/.
-        ValueError: Si los datos no tienen el schema esperado.
-    """
+    """Pipeline completo de ingesta."""
     logger.info("=" * 60)
     logger.info("FASE 1: INGESTA DE DATOS")
     logger.info("=" * 60)
 
-    # 1. Detectar archivo
     raw_file = detect_raw_file()
     if raw_file is None:
         logger.error(
-            "No se encontraron datos en %s.\n"
-            "Por favor, descarga los datos de Eurocontrol ADRR o Kaggle "
-            "y colocalos en esa carpeta antes de continuar.",
-            DATA_RAW_DIR,
+            "No se encontraron datos en %s. "
+            "Coloca el CSV de vuelos en esa carpeta.", DATA_RAW_DIR
         )
         sys.exit(1)
 
-    # 2. Cargar datos
     df = load_raw_data(raw_file)
-
-    # 3. Normalizar columnas
-    df = normalize_column_names(df)
-
-    # 4. Validar schema
-    validate_schema(df)
-
-    # 5. Filtrar aerolineas
+    df = rename_columns(df)
     df_filtered = filter_low_cost_airlines(df)
 
-    # 6. Guardar
     FLIGHTS_RAW_FILTERED.parent.mkdir(parents=True, exist_ok=True)
     df_filtered.to_parquet(FLIGHTS_RAW_FILTERED, index=False)
-    logger.info(
-        "Datos filtrados guardados en: %s (%d filas)",
-        FLIGHTS_RAW_FILTERED,
-        len(df_filtered),
-    )
+    logger.info("Guardado: %s (%d filas)", FLIGHTS_RAW_FILTERED, len(df_filtered))
 
     return df_filtered
 
