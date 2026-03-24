@@ -1,0 +1,54 @@
+# Datos (NO subir a git - pueden contener datos sensibles o ser muy grandes)
+data/raw/
+data/processed/
+data/external/
+
+# Modelos serializados (pueden ser muy grandes)
+outputs/models/
+
+# Entorno virtual
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Variables de entorno
+.env
+.env.local
+
+# Outputs (las figuras y tablas se regeneran con make figures)
+# outputs/figures/  <- dejar en git para que el tutor pueda ver resultados
+# outputs/tables/   <- dejar en git
+
+# Archivos temporales
+*.tmp
+*.temp
